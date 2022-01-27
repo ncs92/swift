@@ -27,6 +27,7 @@
 #include "Tracing.h"
 #include "Debug.h"
 #include "Error.h"
+#include <atomic>
 
 #if SWIFT_CONCURRENCY_ENABLE_DISPATCH
 #include <dispatch/dispatch.h>

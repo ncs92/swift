@@ -93,6 +93,7 @@ struct StackAllocator {
   };
 };
 
+// TODO (rokhinip): Do I need to change things in this struct? What is it for?
 template <typename Runtime>
 struct ActiveTaskStatus {
   typename Runtime::StoredPointer Record;

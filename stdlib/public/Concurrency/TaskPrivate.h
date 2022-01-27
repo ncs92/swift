@@ -26,6 +26,7 @@
 #include "swift/Runtime/Error.h"
 #include "swift/Runtime/Exclusivity.h"
 #include "swift/Runtime/HeapObject.h"
+#include <atomic>
 
 #define SWIFT_FATAL_ERROR swift_Concurrency_fatalError
 #include "../runtime/StackAllocator.h"
@@ -168,7 +169,38 @@ public:
 
 /// The current state of a task's status records.
 class alignas(sizeof(void*) * 2) ActiveTaskStatus {
-  enum : uintptr_t {
+
+  /// 32 bit systems with SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION=1
+  ///
+  ///          Flags                 Drain Lock             Unused           TaskStatusRecord *
+  /// |----------------------|----------------------|----------------------|-------------------|
+  ///          32 bits                32 bits                32 bits              32 bits
+  ///
+  ///
+  /// 64 bit systems with SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION=1
+  ///
+  ///         Flags               Drain Lock          TaskStatusRecord *
+  /// |----------------------|-------------------|----------------------|
+  ///          32 bits                32 bits              64 bits
+  ///
+  /// 32 bit systems with SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION=0
+  ///
+  ///          Flags             TaskStatusRecord *
+  /// |----------------------|----------------------|
+  ///          32 bits                32 bits
+  //
+  /// 64 bit systems with SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION=0
+  ///
+  ///         Flags                  Unused            TaskStatusRecord *
+  /// |----------------------|----------------------|---------------------|
+  ///         32 bits                 32 bits                64 bits
+  ///
+  /// Note: This layout is intentional since we can then do 64bit atomics on
+  /// just the top 64 bits of atomic state when
+  /// SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION=1 if we don't need to
+  /// coordinate with the status record pointer.
+
+  enum : uint32_t {
     /// The max priority of the task. This is always >= basePriority in the task
     PriorityMask = 0xFF,
 
@@ -184,20 +216,42 @@ class alignas(sizeof(void*) * 2) ActiveTaskStatus {
     /// priority recorded in the Job header.
     IsEscalated = 0x400,
 
-    /// Whether the task is actively running.
-    /// We don't really need to be tracking this in the runtime right
-    /// now, but we will need to eventually track enough information to
-    /// escalate the thread that's running a task, so doing the stores
-    /// necessary to maintain this gives us a more realistic baseline
-    /// for performance.
+#if !SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
+    /// Whether the task is actively running. On systems which cannot track the
+    /// identity of the drainer (see above), we use one bit in the flags to track
+    /// whether or not task is running. Otherwise, the drain lock tells us
+    /// whether or not it is running.
     IsRunning = 0x800,
+#endif
+
   };
 
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION && SWIFT_POINTER_IS_4_BYTES
+  uint32_t Flags;
+  dispatch_lock_t DrainLock;
+  uint32_t Unused;
+#elif SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION && SWIFT_POINTER_IS_8_BYTES
+  uint32_t Flags;
+  dispatch_lock_t DrainLock;
+#elif !SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION && SWIFT_POINTER_IS_4_BYTES
+  uint32_t Flags;
+#else /* !SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION && SWIFT_POINTER_IS_8_BYTES */
+  uint32_t Flags;
+  uint32_t Unused;
+#endif
   TaskStatusRecord *Record;
-  uintptr_t Flags;
 
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
   ActiveTaskStatus(TaskStatusRecord *record, uintptr_t flags)
-    : Record(record), Flags(flags) {}
+    : Flags(flags), DrainLock(DLOCK_OWNER_NULL), Record(record) {}
+
+  ActiveTaskStatus(TaskStatusRecord *record, uintptr_t flags, dispatch_lock_t drainLockValue)
+    : Flags(flags), DrainLock(drainLockValue), Record(record) {}
+
+#else
+  ActiveTaskStatus(TaskStatusRecord *record, uintptr_t flags)
+    : Flags(flags), Record(record) {}
+#endif
 
 public:
 #ifdef __GLIBCXX__
@@ -207,23 +261,56 @@ public:
   ActiveTaskStatus() = default;
 #endif
 
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
   constexpr ActiveTaskStatus(JobPriority priority)
-      : Record(nullptr), Flags(uintptr_t(priority)) {}
+      : Flags(uintptr_t(priority)), DrainLock(DLOCK_OWNER_NULL), Record(nullptr) {}
+#else
+  constexpr ActiveTaskStatus(JobPriority priority)
+      : Flags(uintptr_t(priority)), Record(nullptr) {}
+#endif
 
   /// Is the task currently cancelled?
   bool isCancelled() const { return Flags & IsCancelled; }
   ActiveTaskStatus withCancelled() const {
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
+    return ActiveTaskStatus(Record, Flags | IsCancelled, DrainLock);
+#else
     return ActiveTaskStatus(Record, Flags | IsCancelled);
+#endif
   }
 
   /// Is the task currently running?
   /// Eventually we'll track this with more specificity, like whether
   /// it's running on a specific thread, enqueued on a specific actor,
   /// etc.
-  bool isRunning() const { return Flags & IsRunning; }
+  bool isRunning() const {
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
+  return dispatch_lock_is_locked(DrainLock);
+#else
+    return Flags & IsRunning;
+#endif
+  }
+
+  uint32_t currentDrainer() const {
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
+  return dispatch_lock_owner(DrainLock);
+#else
+  return 0;
+#endif
+  }
+
   ActiveTaskStatus withRunning(bool isRunning) const {
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
+  if (isRunning) {
+    assert(!dispatch_lock_is_locked(DrainLock));
+    return ActiveTaskStatus(Record, Flags, dispatch_lock_value_for_self());
+  } else {
+    return ActiveTaskStatus(Record, Flags, DrainLock & ~DLOCK_OWNER_MASK);
+  }
+#else
     return ActiveTaskStatus(Record, isRunning ? (Flags | IsRunning)
                                               : (Flags & ~IsRunning));
+#endif
   }
 
   /// Is there an active lock on the cancellation information?
@@ -231,7 +318,11 @@ public:
   ActiveTaskStatus withLockingRecord(TaskStatusRecord *lockRecord) const {
     assert(!isStatusRecordLocked());
     assert(lockRecord->Parent == Record);
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
+    return ActiveTaskStatus(lockRecord, Flags | IsStatusRecordLocked, DrainLock);
+#else
     return ActiveTaskStatus(lockRecord, Flags | IsStatusRecordLocked);
+#endif
   }
 
   JobPriority getStoredPriority() const {
@@ -243,23 +334,33 @@ public:
 
   /// Creates a new active task status for a task with the specified priority
   /// and masks away any existing priority related flags on the task status. All
-  /// other flags about the task are unmodified. This is only safe to use to
-  /// generate an initial task status for a new task that is not yet running.
+  /// other flags about the task are unmodified. This is only safe to use when
+  /// we know that the task we're modifying is not running.
   ActiveTaskStatus withNewPriority(JobPriority priority) const {
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
+    assert(DrainLock == DLOCK_OWNER_NULL);
+#endif
     return ActiveTaskStatus(Record,
                             (Flags & ~PriorityMask) | uintptr_t(priority));
   }
 
   ActiveTaskStatus withEscalatedPriority(JobPriority priority) const {
     assert(priority > getStoredPriority());
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
     return ActiveTaskStatus(Record,
                             (Flags & ~PriorityMask)
-                               | IsEscalated | uintptr_t(priority));
+                               | IsEscalated | uintptr_t(priority), DrainLock);
+#else
+    return ActiveTaskStatus(Record, (Flags & ~PriorityMask) | IsEscalated | uintptr_t(priority));
+#endif
   }
 
   ActiveTaskStatus withoutStoredPriorityEscalation() const {
-    assert(isStoredPriorityEscalated());
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
+    return ActiveTaskStatus(Record, Flags & ~IsEscalated, DrainLock);
+#else
     return ActiveTaskStatus(Record, Flags & ~IsEscalated);
+#endif
   }
 
   /// Return the innermost cancellation record.  Code running
@@ -269,7 +370,11 @@ public:
     return Record;
   }
   ActiveTaskStatus withInnermostRecord(TaskStatusRecord *newRecord) {
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
+    return ActiveTaskStatus(newRecord, Flags, DrainLock);
+#else
     return ActiveTaskStatus(newRecord, Flags);
+#endif
   }
 
   static TaskStatusRecord *getStatusRecordParent(TaskStatusRecord *ptr);
@@ -284,6 +389,14 @@ public:
     concurrency::trace::task_status_changed(task, Flags);
   }
 };
+
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION && SWIFT_POINTER_IS_4_BYTES
+static_assert(sizeof(ActiveTaskStatus) == 4 * sizeof(uintptr_t),
+  "ActiveTaskStatus is 4 words large");
+#else
+static_assert(sizeof(ActiveTaskStatus) == 2 * sizeof(uintptr_t),
+  "ActiveTaskStatus is 2 words large");
+#endif
 
 /// The size of an allocator slab. We want the full allocation to fit into a
 /// 1024-byte malloc quantum. We subtract off the slab header size, plus a

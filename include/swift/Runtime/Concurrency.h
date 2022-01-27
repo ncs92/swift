@@ -41,6 +41,21 @@
 #endif
 #endif
 
+// Does the runtime provide priority escalation support?
+//
+// TODO (rokhinip): Is there a more robust/explicit way to determine platforms
+// which support 128 bit DCAS?
+#ifndef SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
+#if SWIFT_CONCURRENCY_ENABLE_DISPATCH && \
+	__has_include(<dispatch/swift_concurrency_private.h>) && __APPLE__ && \
+	(defined(__x86_64__) || defined(__arm64__))
+#define SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION 1
+#include <dispatch/swift_concurrency_private.h>
+#else
+#define SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION 0
+#endif
+#endif /* SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION */
+
 namespace swift {
 class DefaultActor;
 class TaskOptionRecord;
