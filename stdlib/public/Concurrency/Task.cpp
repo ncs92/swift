@@ -142,9 +142,12 @@ FutureFragment::Status AsyncTask::waitFuture(AsyncTask *waitingTask,
             queueHead, newQueueHead,
             /*success*/ std::memory_order_release,
             /*failure*/ std::memory_order_acquire)) {
+
       // Escalate the priority of this task based on the priority
       // of the waiting task.
-      swift_task_escalate(this, waitingTask->Flags.getPriority());
+      auto status = waitingTask->_private().Status.load(std::memory_order_relaxed);
+      swift_task_escalate(this, status.getStoredPriority());
+
       _swift_task_clearCurrent();
       return FutureFragment::Status::Executing;
     }
@@ -635,7 +638,7 @@ static AsyncTaskAndContext swift_task_create_commonImpl(
      basePriority = JobPriority::Default;
   }
 
-  SWIFT_TASK_DEBUG_LOG("Task's base priority = %d", basePriority);
+  SWIFT_TASK_DEBUG_LOG("Task's base priority = %#x", basePriority);
 
   // TODO (rokhinip): Figure out the semantics of the job priority and where
   // it ought to be set conclusively - seems like it ought to be at enqueue

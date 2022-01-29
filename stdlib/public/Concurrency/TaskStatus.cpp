@@ -575,6 +575,38 @@ static swift_task_escalateImpl(AsyncTask *task, JobPriority newPriority) {
     }
   }
 
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
+  if (newStatus.isRunning()) {
+    // The task is running, escalate the thread that is running it. The
+    // dispatch SPI does an atomic debounce on the lock address to make sure
+    // that the thread that is expected to be the drainer is still the
+    //
+    // The current dispatch API only looks at the owner field but
+    // eventually, we might want to have a fancy debounce logic on the
+    // full 64 bit states including flags.
+    uint64_t *drain_lock_and_flags = (uint64_t *)&task->_private().Status;
+    dispatch_lock_t *drain_lock = (dispatch_lock_t *)((char *) drain_lock_and_flags + sizeof(uint32_t));
+
+    SWIFT_TASK_DEBUG_LOG("[Override] Escalating %p which is running on %#x to %#x", task, newStatus.currentDrainer(), newPriority);
+    dispatch_lock_override_start_with_debounce(drain_lock, newStatus.currentDrainer(), (qos_class_t) newPriority);
+  } else if (newStatus.isEnqueued()) {
+    //  Task is not running, it's enqueued somewhere waiting to be run
+    //
+    // TODO (rokhinip): Add a stealer to escalate the thread request for
+    // the task. Still mark the task has having been escalated so that the
+    // thread will self override when it starts draining the task
+    //
+    // TODO (rokhinip): Add a signpost to flag that this is a potential
+    // priority inversion
+  } else {
+    SWIFT_TASK_DEBUG_LOG("[Override] Escalating %p which is suspended to %#x", task, newPriority);
+
+    // TODO (rokhinip): Move this update of job flags to the point where the
+    // job gets enqueued
+    task->Flags.setPriority(newPriority);
+    concurrency::trace::task_flags_changed(task, task->Flags.getOpaqueValue());
+  }
+#endif
 
   // As with cancellation, new tasks can get added to the task between
   // when we adjusted its atomic state and when we grabbed the status record
@@ -587,6 +619,8 @@ static swift_task_escalateImpl(AsyncTask *task, JobPriority newPriority) {
       performEscalationAction(cur, newPriority);
     }
   });
+  // TODO (rokhinip): If the task is awaiting on another task that is not a
+  // child task, we need to escalate whoever we are already awaiting on
 
   return newStatus.getStoredPriority();
 }
